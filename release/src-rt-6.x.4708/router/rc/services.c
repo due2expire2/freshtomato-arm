@@ -31,7 +31,7 @@
  *
  * Modified for Tomato Firmware
  * Portions, Copyright (C) 2006-2009 Jonathan Zarate
- * Fixes/updates (C) 2018 - 2025 pedro
+ * Fixes/updates (C) 2018 - 2024 pedro
  *
  */
 
@@ -294,63 +294,46 @@ void del_bsd_defaults(void)
 }
 #endif /* TCONFIG_BCMBSD */
 
-void start_dnsmasq_wet()
+bool is_wet_psta(const char* bridge)
 {
-	FILE *f;
-	const char *nv;
-	char br;
-	char lanN_ifname[] = "lanXX_ifname";
+	char lanN_ifnames[] = "lanXX_ifnames";
+	snprintf(lanN_ifnames, sizeof(lanN_ifnames), "lan%s_ifnames", bridge);
 
-	if ((f = fopen(DNSMASQ_CONF, "w")) == NULL) {
-		logerr(__FUNCTION__, __LINE__, DNSMASQ_CONF);
-		return;
+	char *ifnames;
+	if ((ifnames = strdup(nvram_safe_get(lanN_ifnames))) == NULL) {
+		return FALSE;
 	}
 
-	fprintf(f, "pid-file=/var/run/dnsmasq.pid\n"
-	           "resolv-file=%s\n"				/* the real stuff is here */
-	           "min-port=%u\n"				/* min port used for random src port */
-	           "no-negcache\n"				/* disable negative caching */
-	           "bind-dynamic\n",
-	           dmresolv,
-	           4096);
+	char *ifname;
+	char *p = ifnames;
+	while ((ifname = strsep(&p, " ")) != NULL) {
+		while (*ifname == ' ') {
+			++ifname;
+		}
 
-	for (br = 0; br < BRIDGE_COUNT; br++) {
-		char bridge[2] = "0";
-		if (br != 0)
-			bridge[0] += br;
-		else
-			memset(bridge, 0, sizeof(bridge));
+		trimstr(ifname);
+		if ((*ifname == 0) || (strncasecmp(ifname, "eth", 3) != 0)) {
+			continue;
+		}
 
-		snprintf(lanN_ifname, sizeof(lanN_ifname), "lan%s_ifname", bridge);
-		nv = nvram_safe_get(lanN_ifname);
+		char wl_ifname[NVRAM_MAX_PARAM_LEN];
+		if (osifname_to_nvifname(ifname, wl_ifname, sizeof(wl_ifname)) != 0) {
+			continue;
+		}
 
-		if (strncmp(nv, "br", 2) == 0) {
-			fprintf(f, "interface=%s\n", nv);
-			fprintf(f, "no-dhcp-interface=%s\n", nv);
+		char nvkey[NVRAM_MAX_PARAM_LEN];
+		strlcat_r(wl_ifname, "_mode", nvkey, sizeof(nvkey));
+		const char *value = nvram_get(nvkey);
+		if (value == NULL || *value == 0) {
+			continue;
+		}
+		if (!strncasecmp(value, "wet", 3) || !strncasecmp(value, "psta", 4)) {
+			free(ifnames);
+			return TRUE;
 		}
 	}
-
-	if (nvram_get_int("dnsmasq_debug"))
-		fprintf(f, "log-queries\n");
-
-	if ((nvram_get_int("adblock_enable")) && (f_exists("/etc/dnsmasq.adblock")))
-		fprintf(f, "conf-file=/etc/dnsmasq.adblock\n");
-
-	if (!nvram_get_int("dnsmasq_safe")) {
-		fprintf(f, "%s\n", nvram_safe_get("dnsmasq_custom"));
-		fappend(f, "/etc/dnsmasq.custom");
-	}
-	else
-		logmsg(LOG_WARNING, "Warning! Dnsmasq Custom configuration contains a disruptive syntax error. The Custom configuration is now excluded to allow dnsmasq to operate");
-
-	fappend(f, "/etc/dnsmasq.ipset");
-
-	fclose(f);
-
-	unlink(RESOLV_CONF);
-	symlink("/rom/etc/resolv.conf", RESOLV_CONF); /* nameserver 127.0.0.1 */
-
-	eval("dnsmasq", "-c", "4096", "--log-async");
+	free(ifnames);
+	return FALSE;
 }
 
 void start_dnsmasq()
@@ -388,22 +371,6 @@ void start_dnsmasq()
 
 	if (serialize_restart("dnsmasq", 1))
 		return;
-
-	/* check wireless ethernet bridge (wet) after stop_dnsmasq() */
-	if (foreach_wif(1, NULL, is_wet)) {
-		logmsg(LOG_INFO, "Starting dnsmasq for wireless ethernet bridge mode");
-		start_dnsmasq_wet();
-		return;
-	}
-
-#ifdef TCONFIG_BCMWL6
-	/* check media bridge (psta) after stop_dnsmasq() */
-	if (foreach_wif(1, NULL, is_psta)) {
-		logmsg(LOG_INFO, "Starting dnsmasq for media bridge mode");
-		start_dnsmasq_wet();
-		return;
-	}
-#endif /* TCONFIG_BCMWL6 */
 
 	if ((f = fopen(DNSMASQ_CONF, "w")) == NULL) {
 		logerr(__FUNCTION__, __LINE__, DNSMASQ_CONF);
@@ -534,6 +501,14 @@ void start_dnsmasq()
 		snprintf(lanN_proto, sizeof(lanN_proto), "lan%s_proto", bridge);
 		snprintf(lanN_ifname, sizeof(lanN_ifname), "lan%s_ifname", bridge);
 		snprintf(lanN_ipaddr, sizeof(lanN_ipaddr), "lan%s_ipaddr", bridge);
+
+		if (strcmp(nvram_safe_get(lanN_ifname), "") != 0) {
+			fprintf(f, "interface=%s\n", nvram_safe_get(lanN_ifname));
+			if (is_wet_psta(bridge)) {
+				fprintf(f, "no-dhcp-interface=%s\n", nvram_safe_get(lanN_ifname));
+			}
+		}
+
 		do_dhcpd = nvram_match(lanN_proto, "dhcp");
 		if (do_dhcpd) {
 			do_dhcpd_hosts++;
@@ -542,8 +517,6 @@ void start_dnsmasq()
 			strlcpy(lan, router_ip, sizeof(lan));
 			if ((p = strrchr(lan, '.')) != NULL)
 				*(p + 1) = 0;
-
-			fprintf(f, "interface=%s\n", nvram_safe_get(lanN_ifname));
 
 			snprintf(dhcpN_lease, sizeof(dhcpN_lease), "dhcp%s_lease", bridge);
 			dhcp_lease = nvram_get_int(dhcpN_lease);
@@ -621,10 +594,6 @@ void start_dnsmasq()
 			}
 #endif
 		}
-		else {
-			if (strcmp(nvram_safe_get(lanN_ifname), "") != 0)
-				fprintf(f, "interface=%s\n", nvram_safe_get(lanN_ifname));
-		}
 	}
 
 	/* write static lease entries & create hosts file */
@@ -637,17 +606,26 @@ void start_dnsmasq()
 		else if ((nv = nvram_safe_get("lan_hostname")) && (*nv)) /* FIXME: it has to be implemented (lan_hostname is always empty) */
 			fprintf(hf, "%s %s\n", router_ip, nv);
 #endif
-		for (i = 1; i <= MWAN_MAX; i++) {
-			memset(tmp, 0, sizeof(tmp));
-			snprintf(tmp, sizeof(tmp), (i == 1 ? "wan" : "wan%d"), i);
-			p = (char *)get_wanip(tmp);
-			if ((!*p) || (strcmp(p, "0.0.0.0") == 0))
-				p = "127.0.0.1";
+		p = (char *)get_wanip("wan");
+		if ((!*p) || strcmp(p, "0.0.0.0") == 0)
+			p = "127.0.0.1";
+		fprintf(hf, "%s wan1-ip\n", p);
 
-			memset(tmp, 0, sizeof(tmp));
-			snprintf(tmp, sizeof(tmp), "%s wan%d-ip\n", p, i);
-			fprintf(hf, tmp, p);
-		}
+		p = (char *)get_wanip("wan2");
+		if ((!*p) || strcmp(p, "0.0.0.0") == 0)
+			p = "127.0.0.1";
+		fprintf(hf, "%s wan2-ip\n", p);
+#ifdef TCONFIG_MULTIWAN
+		p = (char *)get_wanip("wan3");
+		if ((!*p) || strcmp(p, "0.0.0.0") == 0)
+			p = "127.0.0.1";
+		fprintf(hf, "%s wan3-ip\n", p);
+
+		p = (char *)get_wanip("wan4");
+		if ((!*p) || strcmp(p, "0.0.0.0") == 0)
+			p = "127.0.0.1";
+		fprintf(hf, "%s wan4-ip\n", p);
+#endif
 	}
 
 	/* add dhcp reservations
@@ -1156,8 +1134,7 @@ void stop_stubby(void)
 void generate_mdns_config(void)
 {
 	FILE *fp;
-	char avahi_config[80], tmp[8];
-	unsigned int i;
+	char avahi_config[80];
 
 	snprintf(avahi_config, sizeof(avahi_config), "%s/%s", AVAHI_CONFIG_PATH, AVAHI_CONFIG_FN);
 
@@ -1171,15 +1148,18 @@ void generate_mdns_config(void)
 	fprintf(fp, "[Server]\n"
 	            "use-ipv4=yes\n"
 	            "use-ipv6=%s\n"
-	            "deny-interfaces=",
-	            ipv6_enabled() ? "yes" : "no");
+	            "deny-interfaces=%s",
+	            ipv6_enabled() ? "yes" : "no",
+	            get_wanface("wan"));
 
-	for (i = 1; i <= MWAN_MAX; i++) {
-		memset(tmp, 0, sizeof(tmp));
-		snprintf(tmp, sizeof(tmp), (i == 1 ? "wan" : "wan%d"), i);
-		if ((check_wanup(tmp)) || (i == 1))
-			fprintf(fp, "%s%s", (i == 1 ? "" : ","), get_wanface(tmp));
-	}
+	if (check_wanup("wan2"))
+		fprintf(fp, ",%s", get_wanface("wan2"));
+#ifdef TCONFIG_MULTIWAN
+	if (check_wanup("wan3"))
+		fprintf(fp, ",%s", get_wanface("wan3"));
+	if (check_wanup("wan4"))
+		fprintf(fp, ",%s", get_wanface("wan4"));
+#endif
 
 	fprintf(fp, "\n"
 	            "ratelimit-interval-usec=1000000\n"
@@ -1760,10 +1740,8 @@ void start_upnp(void)
 	char lanN_netmask[] = "lanXX_netmask";
 	char lanN_ifname[] = "lanXX_ifname";
 	char upnp_lanN[] = "upnp_lanXX";
-	char tmp[8];
 	char *lanip, *lanmask, *lanifname;
 	char br;
-	unsigned int i;
 
 	enable = nvram_get_int("upnp_enable");
 
@@ -1791,18 +1769,23 @@ void start_upnp(void)
 
 	/* GUI configuration */
 
-	/* TODO: not implemented in GUI */
+	/* not implemented in GUI */
 	upnp_port = nvram_get_int("upnp_port");
 	if ((upnp_port < 0) || (upnp_port >= 0xFFFF))
 		upnp_port = 0;
 
-	for (i = 1; i <= MWAN_MAX; i++) {
-		memset(tmp, 0, sizeof(tmp));
-		snprintf(tmp, sizeof(tmp), (i == 1 ? "wan" : "wan%d"), i);
-		if ((check_wanup(tmp)) || (i == 1))
-			fprintf(f, "ext_ifname=%s\n", get_wanface(tmp));
-	}
-	fprintf(f, "port=%d\n"
+	if (check_wanup("wan2"))
+		fprintf(f, "ext_ifname=%s\n", get_wanface("wan2"));
+#ifdef TCONFIG_MULTIWAN
+	if (check_wanup("wan3"))
+		fprintf(f, "ext_ifname=%s\n", get_wanface("wan3"));
+
+	if (check_wanup("wan4"))
+		fprintf(f, "ext_ifname=%s\n", get_wanface("wan4"));
+#endif
+
+	fprintf(f, "ext_ifname=%s\n"
+	           "port=%d\n"
 	           "enable_upnp=%s\n"
 	           "enable_pcp_pmp=%s\n"
 	           "force_igd_desc_v1=yes\n"
@@ -1822,6 +1805,7 @@ void start_upnp(void)
 	           "model_number=\n"
 	           "serial=\n"
 	           "\n",
+	           get_wanface("wan"),
 	           upnp_port,
 	           (enable & 1) ? "yes" : "no",			/* upnp enable */
 	           (enable & 2) ? "yes" : "no",			/* pcp_pmp enable */
@@ -3151,17 +3135,31 @@ TOP:
 	}
 #endif /* TCONFIG_BCMBSD */
 
-	for (i = 1; i <= MWAN_MAX; i++) {
-		memset(buffer2, 0, sizeof(buffer2));
-		snprintf(buffer2, sizeof(buffer2), (i == 1 ? "dhcpc_wan" : "dhcpc_wan%d"), i);
-		if (strcmp(service, buffer2) == 0) {
-			memset(buffer2, 0, sizeof(buffer2));
-			snprintf(buffer2, sizeof(buffer2), (i == 1 ? "wan" : "wan%d"), i);
-			if (act_stop) stop_dhcpc(buffer2);
-			if (act_start) start_dhcpc(buffer2);
-			goto CLEAR;
-		}
+	if (strcmp(service, "dhcpc_wan") == 0) {
+		if (act_stop) stop_dhcpc("wan");
+		if (act_start) start_dhcpc("wan");
+		goto CLEAR;
 	}
+
+	if (strcmp(service, "dhcpc_wan2") == 0) {
+		if (act_stop) stop_dhcpc("wan2");
+		if (act_start) start_dhcpc("wan2");
+		goto CLEAR;
+	}
+
+#ifdef TCONFIG_MULTIWAN
+	if (strcmp(service, "dhcpc_wan3") == 0) {
+		if (act_stop) stop_dhcpc("wan3");
+		if (act_start) start_dhcpc("wan3");
+		goto CLEAR;
+	}
+
+	if (strcmp(service, "dhcpc_wan4") == 0) {
+		if (act_stop) stop_dhcpc("wan4");
+		if (act_start) start_dhcpc("wan4");
+		goto CLEAR;
+	}
+#endif
 
 	if (strcmp(service, "dnsmasq") == 0) {
 		if (act_stop) stop_dnsmasq();
@@ -3281,21 +3279,25 @@ TOP:
 
 	if (strcmp(service, "qos") == 0) {
 		if (act_stop) {
-			for (i = 1; i <= MWAN_MAX; i++) {
-				memset(buffer2, 0, sizeof(buffer2));
-				snprintf(buffer2, sizeof(buffer2), (i == 1 ? "wan" : "wan%d"), i);
-				stop_qos(buffer2);
-			}
+			stop_qos("wan");
+			stop_qos("wan2");
+#ifdef TCONFIG_MULTIWAN
+			stop_qos("wan3");
+			stop_qos("wan4");
+#endif
 		}
 		stop_firewall();
 		start_firewall(); /* always restarted */
 		if (act_start) {
-			for (i = 1; i <= MWAN_MAX; i++) {
-				memset(buffer2, 0, sizeof(buffer2));
-				snprintf(buffer2, sizeof(buffer2), (i == 1 ? "wan" : "wan%d"), i);
-				if ((check_wanup(buffer2)) || (i == 1))
-					start_qos(buffer2);
-			}
+			start_qos("wan");
+			if (check_wanup("wan2"))
+				start_qos("wan2");
+#ifdef TCONFIG_MULTIWAN
+			if (check_wanup("wan3"))
+				start_qos("wan3");
+			if (check_wanup("wan4"))
+				start_qos("wan4");
+#endif
 			if (nvram_get_int("qos_reset"))
 				f_write_string("/proc/net/clear_marks", "1", 0, 0);
 		}
@@ -3544,31 +3546,61 @@ TOP:
 		if (act_start) {
 			rename("/tmp/ppp/wan_log", "/tmp/ppp/wan_log.~");
 			start_wan();
-			for (i = 1; i <= MWAN_MAX; i++) {
-				memset(buffer2, 0, sizeof(buffer2));
-				snprintf(buffer2, sizeof(buffer2), (i == 1 ? "wan" : "wan%d"), i);
-				sleep(5);
-				force_to_dial(buffer2);
-			}
+			sleep(5);
+			force_to_dial("wan");
+			sleep(5);
+			force_to_dial("wan2");
+#ifdef TCONFIG_MULTIWAN
+			sleep(5);
+			force_to_dial("wan3");
+			sleep(5);
+			force_to_dial("wan4");
+#endif
 		}
 		goto CLEAR;
 	}
 
-	for (i = 1; i <= MWAN_MAX; i++) {
-		memset(buffer2, 0, sizeof(buffer2));
-		snprintf(buffer2, sizeof(buffer2), "wan%d", i);
-		if (strcmp(service, buffer2) == 0) {
-			memset(buffer2, 0, sizeof(buffer2));
-			snprintf(buffer2, sizeof(buffer2), (i == 1 ? "wan" : "wan%d"), i);
-			if (act_stop) stop_wan_if(buffer2);
-			if (act_start) {
-				start_wan_if(buffer2);
-				sleep(5);
-				force_to_dial(buffer2);
-			}
-			goto CLEAR;
+	if (strcmp(service, "wan1") == 0) {
+		if (act_stop) stop_wan_if("wan");
+		if (act_start) {
+			start_wan_if("wan");
+			sleep(5);
+			force_to_dial("wan");
 		}
+		goto CLEAR;
 	}
+
+	if (strcmp(service, "wan2") == 0) {
+		if (act_stop) stop_wan_if("wan2");
+		if (act_start) {
+			start_wan_if("wan2");
+			sleep(5);
+			force_to_dial("wan2");
+		}
+		goto CLEAR;
+	}
+
+#ifdef TCONFIG_MULTIWAN
+	if (strcmp(service, "wan3") == 0) {
+		if (act_stop) stop_wan_if("wan3");
+		if (act_start) {
+			start_wan_if("wan3");
+			sleep(5);
+			force_to_dial("wan3");
+		}
+		goto CLEAR;
+	}
+
+	if (strcmp(service, "wan4") == 0) {
+		if (act_stop) stop_wan_if("wan4");
+		if (act_start) {
+			start_wan_if("wan4");
+			sleep(5);
+			force_to_dial("wan4");
+		}
+		goto CLEAR;
+	}
+#endif
 
 	if (strcmp(service, "net") == 0) {
 		if (act_stop) {
